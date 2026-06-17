@@ -1,10 +1,10 @@
 """Hie Hie no Mi — ice fruit (Phase 2).
 
-Turns the body to faceted ice: desaturated blue tint, extra contrast, a frosty
-speckle, and — when a face is visible — pale crystalline lines drawn along the
-Face Mesh tessellation so the geometry reads as cut crystal rather than smooth
-skin. (The plan's Voronoi alternative is the other route if you'd rather have
-random cracks not tied to the face topology.)
+Body becomes solid faceted crystal: luminance is mapped to a three-stop ice
+colour palette (dark-navy → icy-cyan → near-white), Voronoi-style crack lines
+cover the whole body, and the face gets denser crystal edges along the actual
+Face Mesh topology. Frost shimmer is very sparse — a glint here and there,
+not a blizzard of white dots.
 """
 
 from __future__ import annotations
@@ -18,44 +18,117 @@ from effects._blend import as_alpha, over
 from effects.base import BaseEffect
 from utils.tracking import Tracking
 
-ICE_TINT = np.array([255, 200, 150], np.float32)  # light blue (BGR)
+_CRACK = (235, 248, 255)  # pale blue-white for body facet lines (BGR)
+_FACET = (250, 252, 255)  # near-white for face mesh lines (BGR)
 
 
 class HieHie(BaseEffect):
     name = "Hie Hie"
-    swatch = (240, 200, 130)  # icy cyan-blue (BGR)
+    swatch = (240, 200, 130)
     requires = {"mask", "face"}
 
-    def _iced(self, frame: np.ndarray) -> np.ndarray:
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
-        hsv[:, :, 1] *= 0.35                                 # desaturate
-        hsv[:, :, 0] = 0.7 * hsv[:, :, 0] + 0.3 * 110.0      # nudge hue toward blue
-        iced = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR)
+    def __init__(self):
+        super().__init__()
+        self._body_tris: list | None = None
+        self._body_shape: tuple | None = None
 
-        iced = iced.astype(np.float32)
-        iced = (iced - 128.0) * 1.25 + 128.0                 # contrast bump
-        iced = 0.78 * iced + 0.22 * ICE_TINT                 # cool tint
-        iced = np.clip(iced, 0, 255).astype(np.uint8)
+    # ------------------------------------------------------------------
+    # Colour grade
+    # ------------------------------------------------------------------
 
-        # Frost speckle: sparse bright noise added on top.
-        noise = np.random.rand(*frame.shape[:2]).astype(np.float32)
-        frost = ((noise > 0.985) * 200).astype(np.uint8)
-        return cv2.add(iced, cv2.cvtColor(frost, cv2.COLOR_GRAY2BGR))
+    def _crystallize(self, frame: np.ndarray) -> np.ndarray:
+        """Map luminance to a three-stop ice palette (shadow→cyan→white).
 
-    def _draw_facets(self, frame: np.ndarray, lm: Tracking) -> None:
-        """Overlay faint crystalline lines: a Delaunay triangulation of the
-        face landmarks (cv2.Subdiv2D), so facets follow the actual face shape.
-
-        This replaces the old face-mesh tessellation constant, which the
-        modern MediaPipe Tasks API no longer ships — and triangulating the real
-        points looks just as crystalline with no extra dependency.
+        This replaces the old HSV-desaturation approach that made people look
+        like ghosts being dispelled. The palette-remap produces solid ice/crystal
+        rather than a washed-out filter, while keeping 15 % of the original so
+        the person stays recognisable.
         """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        lum = gray[:, :, np.newaxis]  # HxWx1
+
+        # BGR colour stops
+        shadow  = np.array([ 90,  40,  15], np.float32)  # dark navy
+        midtone = np.array([210, 170, 100], np.float32)   # icy blue-cyan
+        hilight = np.array([255, 252, 245], np.float32)   # near-white
+
+        pivot = 0.42
+        t1 = np.clip(lum / pivot, 0.0, 1.0)
+        t2 = np.clip((lum - pivot) / (1.0 - pivot), 0.0, 1.0)
+
+        ice = np.where(
+            lum < pivot,
+            shadow  * (1.0 - t1) + midtone * t1,
+            midtone * (1.0 - t2) + hilight * t2,
+        )
+
+        # 15 % original keeps facial features readable through the crystal.
+        ice = 0.85 * ice + 0.15 * frame.astype(np.float32)
+        return np.clip(ice, 0, 255).astype(np.uint8)
+
+    # ------------------------------------------------------------------
+    # Body facets
+    # ------------------------------------------------------------------
+
+    def _ensure_body_tris(self, h: int, w: int) -> list:
+        """Stable jittered-grid Delaunay triangulation (built once per resolution).
+
+        Fixed RNG seed → facets don't swim around between frames.
+        ~55 px grid gives roughly 130 seed points on a 640×480 frame.
+        """
+        if self._body_tris is not None and self._body_shape == (h, w):
+            return self._body_tris
+
+        rng  = np.random.default_rng(7)
+        cell = 55
+        pts: list[tuple[float, float]] = []
+        for y in range(0, h + cell, cell):
+            for x in range(0, w + cell, cell):
+                jx = int(np.clip(x + rng.integers(-cell // 3, cell // 3 + 1), 0, w - 1))
+                jy = int(np.clip(y + rng.integers(-cell // 3, cell // 3 + 1), 0, h - 1))
+                pts.append((float(jx), float(jy)))
+
+        subdiv = cv2.Subdiv2D((0, 0, w, h))
+        for p in pts:
+            subdiv.insert(p)
+
+        tris = []
+        for tri_data in subdiv.getTriangleList():
+            xs = [tri_data[0], tri_data[2], tri_data[4]]
+            ys = [tri_data[1], tri_data[3], tri_data[5]]
+            if min(xs) >= 0 and max(xs) <= w and min(ys) >= 0 and max(ys) <= h:
+                tris.append(
+                    np.array([(xs[0], ys[0]), (xs[1], ys[1]), (xs[2], ys[2])], np.int32)
+                )
+
+        self._body_tris = tris
+        self._body_shape = (h, w)
+        return tris
+
+    def _draw_body_facets(self, iced: np.ndarray) -> np.ndarray:
+        """Pale crystal-crack lines drawn on the ice layer at 35 % opacity.
+
+        The body mask is applied later in the composite step, so lines only
+        appear on the body without any per-triangle mask check here.
+        """
+        h, w = iced.shape[:2]
+        overlay = iced.copy()
+        for tri in self._ensure_body_tris(h, w):
+            cv2.polylines(overlay, [tri], True, _CRACK, 1, cv2.LINE_AA)
+        return cv2.addWeighted(iced, 0.65, overlay, 0.35, 0)
+
+    # ------------------------------------------------------------------
+    # Face facets
+    # ------------------------------------------------------------------
+
+    def _draw_face_facets(self, frame: np.ndarray, lm: Tracking) -> None:
+        """Crystal lines along the Face Mesh triangulation, in-place on frame."""
         if lm.face is None:
             return
         h, w = frame.shape[:2]
-        pts = lm.face[:, :2] * np.array([w, h])
-        inside = (pts[:, 0] >= 0) & (pts[:, 0] < w) & (pts[:, 1] >= 0) & (pts[:, 1] < h)
-        pts = pts[inside]
+        pts   = lm.face[:, :2] * np.array([w, h])
+        valid = (pts[:, 0] >= 0) & (pts[:, 0] < w) & (pts[:, 1] >= 0) & (pts[:, 1] < h)
+        pts   = pts[valid]
         if len(pts) < 3:
             return
 
@@ -64,19 +137,59 @@ class HieHie(BaseEffect):
             subdiv.insert((float(x), float(y)))
 
         overlay = frame.copy()
-        for t in subdiv.getTriangleList():
-            tri = [(t[0], t[1]), (t[2], t[3]), (t[4], t[5])]
-            # Drop triangles touching Subdiv2D's outer bounding vertices.
+        for tri_data in subdiv.getTriangleList():
+            tri = [(tri_data[0], tri_data[1]), (tri_data[2], tri_data[3]), (tri_data[4], tri_data[5])]
             if any(not (0 <= x <= w and 0 <= y <= h) for x, y in tri):
                 continue
-            cv2.polylines(overlay, [np.array(tri, np.int32)], True,
-                          (255, 240, 220), 1, cv2.LINE_AA)
-        cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, dst=frame)
+            cv2.polylines(overlay, [np.array(tri, np.int32)], True, _FACET, 1, cv2.LINE_AA)
 
-    def process_frame(self, frame: np.ndarray, landmarks: Tracking,
-                      mask: Optional[np.ndarray], t: float) -> np.ndarray:
-        iced = self._iced(frame)
-        alpha = as_alpha(mask, frame.shape)
+        cv2.addWeighted(overlay, 0.30, frame, 0.70, 0, dst=frame)
+
+    # ------------------------------------------------------------------
+    # Frost shimmer
+    # ------------------------------------------------------------------
+
+    def _frost_shimmer(self, frame: np.ndarray, alpha: np.ndarray, t: float) -> np.ndarray:
+        """Very sparse animated glints — ~0.2 % of body pixels.
+
+        Old threshold was 0.985 (~1.5 % of pixels = blizzard of white dots).
+        0.998 drops that to ~0.2 %, giving occasional glints instead.
+        """
+        h, w = frame.shape[:2]
+        rng   = np.random.default_rng(int(t * 15) % 50000)
+        noise = rng.random((h, w)).astype(np.float32)
+        hits  = (noise > 0.998).astype(np.float32) * alpha[:, :, 0]
+        return np.clip(
+            frame.astype(np.float32) + hits[:, :, np.newaxis] * 210,
+            0, 255,
+        ).astype(np.uint8)
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    def process_frame(
+        self,
+        frame: np.ndarray,
+        landmarks: Tracking,
+        mask: Optional[np.ndarray],
+        t: float,
+    ) -> np.ndarray:
+        alpha = as_alpha(mask, frame.shape)      # float32 HxWx1 body mask
+
+        # 1. Map whole frame to ice palette.
+        iced = self._crystallize(frame)
+
+        # 2. Stamp body-wide crystal facet lines onto the ice layer.
+        iced = self._draw_body_facets(iced)
+
+        # 3. Composite: show the ice layer only where the body mask is active.
         out = over(frame, iced, alpha)
-        self._draw_facets(out, landmarks)  # facets only land on the (visible) face
+
+        # 4. Face mesh crystal lines — denser, anatomically accurate.
+        self._draw_face_facets(out, landmarks)
+
+        # 5. Sparse body-masked shimmer glints.
+        out = self._frost_shimmer(out, alpha, t)
+
         return out
