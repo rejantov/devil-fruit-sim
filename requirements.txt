@@ -1,0 +1,10 @@
+# Devil Fruit Cam — dependencies
+#
+# Python 3.9–3.12 supported. Tested on Python 3.12 with mediapipe 0.10.35.
+# Uses the MediaPipe Tasks API (the legacy `solutions` API was removed in
+# mediapipe 0.10.x). The required .task/.tflite model files are downloaded
+# automatically to models/ on first run — nothing to fetch by hand.
+
+opencv-python>=4.8
+mediapipe>=0.10.14
+numpy>=1.24,<2.0
