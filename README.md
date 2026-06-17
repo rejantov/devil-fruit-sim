@@ -1,4 +1,4 @@
-# Devil Fruit Cam
+# Devil Fruit Sim
 
 A local Python app that uses your webcam to simulate One Piece devil-fruit
 powers in real time. MediaPipe tracks your hands/pose/face and segments your
